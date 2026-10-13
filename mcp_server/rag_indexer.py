@@ -8,7 +8,8 @@ RAG 인덱스 **구성** CLI — 서빙(rag_server.py, MCP)과 의도적으로 �
     1. Qdrant 로컬(파일) 모드는 단일 프로세스 잠금 — 서빙 중 인덱싱하면 잠금을 못
        잡아 sqlite로 저하한 채 벡터가 서빙과 **다른 저장소에** 쌓인다(검색 어긋남).
        그래서 이 인덱서는 Qdrant를 못 잡으면 시작을 거부한다: 인덱싱 전에
-       rag_server(MCP)를 내리고 실행할 것.
+       rag_server(MCP)를 내리고 실행할 것. (Qdrant 서버 모드 --qdrant-url 이면 잠금이 없어
+       서빙 중에도 인덱싱할 수 있다 — 서버 접속 실패 시에는 똑같이 거부한다.)
     2. 서빙 MCP는 읽기 전용(🟢)만 노출돼 모델이 인덱스를 건드릴 수 없다.
 
 인덱싱 대상은 Word(.docx/.doc)·PowerPoint(.pptx/.ppt)·PDF(.pdf)다. Word/PPT는 office
@@ -23,6 +24,7 @@ rag_embed/ 폴더의 .gguf를 llama-server(--embeddings, CPU)로 잠깐 띄웠�
     python rag_indexer.py C:\docs --reindex     # 전부 다시 (임베딩 포함)
     python rag_indexer.py --file C:\docs\a.pptx # 파일 하나만 다시
     python rag_indexer.py --status              # 인덱스 상태 확인
+    python rag_indexer.py C:\docs --qdrant-url http://127.0.0.1:6333  # Qdrant 서버 모드
     python rag_indexer.py --clear               # 삭제 프리뷰 (실행 안 함)
     python rag_indexer.py --clear --yes         # 인덱스 전체 삭제
     python rag_indexer.py C:\docs --no-embed-server        # 임베딩 서버 자동 기동 안 함
@@ -160,12 +162,16 @@ def _require_qdrant_or_exit(store: RagStore) -> None:
     저하한 채 인덱싱하면 벡터가 서빙(Qdrant)과 다른 곳(sqlite BLOB)에 쌓여
     검색이 어긋난다 — 조용한 불일치보다 명시적 거부가 안전하다.
     qdrant-client 자체가 없는 환경은 양쪽 다 sqlite라 일관되므로 그대로 진행한다.
+    단 서버 모드(--qdrant-url)를 지정했다면 서버에 못 붙은 것이므로 거부한다.
     """
-    if core.QDRANT_AVAILABLE and store.vec_kind != "qdrant":
+    if (core.QDRANT_AVAILABLE or core.QDRANT_URL) and store.vec_kind != "qdrant":
         print(f"[중단] Qdrant 벡터 저장소를 열지 못했습니다: {store.vec_error}", file=sys.stderr)
+        hint = (
+            f"Qdrant 서버({core.QDRANT_URL})가 떠 있는지 확인한 뒤 다시 실행하세요. " if core.QDRANT_URL
+            else "rag_server(MCP 서빙)가 떠 있으면 종료한 뒤 다시 실행하세요. "
+        )
         print(
-            "rag_server(MCP 서빙)가 떠 있으면 종료한 뒤 다시 실행하세요. "
-            "(저하한 채 인덱싱하면 서빙과 다른 저장소에 벡터가 쌓여 검색이 어긋납니다)",
+            hint + "(저하한 채 인덱싱하면 서빙과 다른 저장소에 벡터가 쌓여 검색이 어긋납니다)",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -189,6 +195,10 @@ def main() -> None:
     parser.add_argument("--db", default=None, help=f"인덱스 파일 경로 (기본 {core.DB_PATH})")
     parser.add_argument("--qdrant", default=None,
                         help=f"Qdrant 로컬 데이터 폴더 (기본 {core.QDRANT_PATH})")
+    parser.add_argument("--qdrant-url", default=None,
+                        help="Qdrant 서버 주소 (예: http://127.0.0.1:6333). 주면 로컬 폴더 대신 서버 모드")
+    parser.add_argument("--qdrant-collection", default=None,
+                        help=f"Qdrant 벡터 컬렉션 이름 (기본 {core.QDRANT_COLLECTION})")
     parser.add_argument("--embed-url", default=None,
                         help=f"임베딩 서버 /v1 베이스 URL (기본 {core.EMBED_URL})")
     parser.add_argument("--embed-model", default=None,
@@ -203,6 +213,10 @@ def main() -> None:
         core.DB_PATH = os.path.abspath(os.path.expanduser(args.db))
     if args.qdrant:
         core.QDRANT_PATH = os.path.abspath(os.path.expanduser(args.qdrant))
+    if args.qdrant_url:
+        core.QDRANT_URL = args.qdrant_url
+    if args.qdrant_collection:
+        core.QDRANT_COLLECTION = args.qdrant_collection
     if args.embed_url:
         core.EMBED_URL = args.embed_url
 
