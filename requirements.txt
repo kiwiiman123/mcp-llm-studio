@@ -26,6 +26,9 @@ pypdf>=4.0
 # RAG(rag_core.py)의 벡터 저장소 — Qdrant 로컬(파일) 모드 (서버 프로세스 불필요).
 # 사내 미러에 등록돼 있음. 없으면 sqlite BLOB 벡터로 우아하게 저하한다
 # (죽지 않음 — 단 대규모 코퍼스에서 검색이 느려진다).
+# Qdrant 서버 모드(--qdrant-url / RAG_QDRANT_URL)는 같은 패키지로 붙지만 **qdrant 서버
+# 바이너리는 pip로 오지 않는다** — qdrant.exe(GitHub releases의 qdrant-x86_64-pc-windows-msvc.zip)를
+# 별도 반입해 127.0.0.1:6333에 상주시킬 것. 서버 접속 실패 시에도 sqlite BLOB으로 저하한다.
 qdrant-client
 
 # numpy는 선택 의존성 — qdrant가 없어 sqlite 벡터로 저하했을 때 코사인 계산을

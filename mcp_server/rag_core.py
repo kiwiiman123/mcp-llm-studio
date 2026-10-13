@@ -22,11 +22,14 @@ RAG 공용 코어 — 구성(rag_indexer.py)과 서빙(rag_server.py)이 함께 
                 **qdrant-client가 있으면 Qdrant 로컬(파일) 모드**(rag_vectors/,
                 HNSW 근사 검색 — 서버 프로세스 없음)에, 없으면 sqlite BLOB에 저장하고
                 코사인을 직접 계산한다(numpy 있으면 빠르게, 없으면 순수 파이썬).
+                RAG_QDRANT_URL(--qdrant-url)을 주면 **Qdrant 서버 모드**로 같은 API를 쓴다
+                (qdrant 바이너리 별도 반입·상주, 컬렉션은 RAG_QDRANT_COLLECTION).
 
 ⚠ Qdrant 로컬 모드는 단일 프로세스 잠금이 있다 — 구성(rag_indexer)과 서빙(rag_server)을
 동시에 돌리지 말 것. rag_indexer는 잠겨 있으면 시작을 거부한다(서빙과 다른 저장소에
 벡터가 쌓여 검색이 어긋나는 사고 방지). 서빙 쪽은 잠금을 못 잡으면 sqlite BLOB으로
-저하하고 rag_status에 사유를 표시한다.
+저하하고 rag_status에 사유를 표시한다. 서버 모드는 다중 프로세스 접속이라 잠금이 없다
+(서버 접속 실패 시의 저하·거부 규칙은 로컬 잠금과 같다).
 """
 
 from __future__ import annotations
@@ -103,6 +106,11 @@ RERANK_URL = os.getenv("RAG_RERANK_URL", "http://127.0.0.1:8002/v1")
 DB_PATH = os.getenv("RAG_DB", str(Path(__file__).with_name("rag_index.db")))
 # Qdrant 로컬 모드 데이터 폴더 (qdrant-client 있을 때만 사용).
 QDRANT_PATH = os.getenv("RAG_QDRANT", str(Path(__file__).with_name("rag_vectors")))
+# Qdrant 서버 주소 (예: http://127.0.0.1:6333). 비면 로컬 파일 모드(기존 동작).
+# 서버 모드는 다중 프로세스 접속이라 구성·서빙을 동시에 돌려도 된다.
+QDRANT_URL = os.getenv("RAG_QDRANT_URL", "")
+# 벡터 컬렉션 이름 — 서버 하나를 문서/메일 등이 나눠 쓸 때 분리용.
+QDRANT_COLLECTION = os.getenv("RAG_QDRANT_COLLECTION", "chunks")
 
 CHUNK_SIZE = 1000      # 청크 목표 길이(문자)
 CHUNK_OVERLAP = 200    # 청크 사이 겹침(문자)
@@ -594,17 +602,29 @@ _MAX_ROOTS = 32
 
 
 class _QdrantVectors:
-    """Qdrant 로컬(파일) 모드 벡터 백엔드 — HNSW 근사 검색, 서버 프로세스 없음.
+    """Qdrant 벡터 백엔드 — HNSW 근사 검색. url이 비면 로컬(파일) 모드(서버 프로세스 없음,
+    단일 프로세스 잠금), 주면 서버 모드(다중 프로세스 접속). 두 모드의 API는 같다.
 
     포인트 id는 sqlite chunks.id를 그대로 쓴다(두 저장소의 유일한 연결 고리).
     임베딩 모델을 바꿔 차원이 달라지면 컬렉션을 재생성한다(경고 후 reindex 필요).
     """
 
     kind = "qdrant"
-    COLLECTION = "chunks"
 
-    def __init__(self, path: str):
-        self.client = QdrantClient(path=path)
+    def __init__(self, path: str, url: str = "", collection: str = "chunks"):
+        self.COLLECTION = collection  # 인스턴스 속성 — 서버 하나를 컬렉션별로 나눠 쓴다
+        self.mode = "server" if url else "local"
+        if url:
+            self.client = QdrantClient(url=url)
+            # 서버 클라이언트는 첫 요청 때 접속하므로 여기서 한 번 찔러 본다 — 실패하면
+            # 예외가 RagStore까지 올라가 로컬 잠금 실패와 같은 저하 경로를 탄다.
+            try:
+                self.client.get_collections()
+            except Exception:
+                self.close()
+                raise
+        else:
+            self.client = QdrantClient(path=path)
 
     def dim(self) -> int:
         try:
@@ -624,10 +644,14 @@ class _QdrantVectors:
                 file=sys.stderr,
             )
             self.client.delete_collection(self.COLLECTION)
-        self.client.create_collection(
-            self.COLLECTION,
-            vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
-        )
+        try:
+            self.client.create_collection(
+                self.COLLECTION,
+                vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+            )
+        except Exception:  # noqa: BLE001 — 서버 모드에서 다른 프로세스가 먼저 만든 경우
+            if self.dim() != dim:
+                raise
 
     def upsert(self, ids: list[int], vecs: list[list[float]]) -> None:
         if not ids:
@@ -677,11 +701,16 @@ class _QdrantVectors:
 
 
 class RagStore:
-    """인덱스 sqlite 파일 하나(+ 선택적 Qdrant 벡터 폴더)를 관리한다. 스레드 안전."""
+    """인덱스 sqlite 파일 하나(+ 선택적 Qdrant 벡터 폴더/서버 컬렉션)를 관리한다. 스레드 안전.
+
+    Qdrant 서버 주소·컬렉션은 생성 시점의 모듈 설정(QDRANT_URL/QDRANT_COLLECTION)을 쓴다.
+    """
 
     def __init__(self, path: str, qdrant_path: str = ""):
         self.path = path
         self.qdrant_path = qdrant_path
+        self.qdrant_url = QDRANT_URL
+        self.qdrant_collection = QDRANT_COLLECTION
         self._lock = threading.Lock()
         self._fts = False
         self._vec_cache: tuple[int, list, object] | None = None  # (세대, ids, 행렬) — sqlite 백엔드용
@@ -689,14 +718,15 @@ class RagStore:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._init_schema()
-        # 벡터 백엔드: Qdrant 로컬 → 실패 시 sqlite BLOB (우아한 저하).
+        # 벡터 백엔드: Qdrant 서버(URL 지정 시) 또는 로컬 → 실패 시 sqlite BLOB (우아한 저하).
         self.vec: _QdrantVectors | None = None
         self.vec_error = "" if QDRANT_AVAILABLE else f"qdrant-client 없음({QDRANT_IMPORT_ERROR})"
-        if QDRANT_AVAILABLE and qdrant_path:
+        if QDRANT_AVAILABLE and (qdrant_path or self.qdrant_url):
             try:
-                self.vec = _QdrantVectors(qdrant_path)
-            except Exception as e:  # noqa: BLE001 — 다른 프로세스가 잠근 경우 등
-                self.vec_error = f"Qdrant 열기 실패({type(e).__name__}: {e}) — sqlite BLOB으로 저하"
+                self.vec = _QdrantVectors(qdrant_path, self.qdrant_url, self.qdrant_collection)
+            except Exception as e:  # noqa: BLE001 — 다른 프로세스가 잠근 경우, 서버 접속 실패 등
+                what = f"Qdrant 서버 접속 실패 [{self.qdrant_url}]" if self.qdrant_url else "Qdrant 열기 실패"
+                self.vec_error = f"{what}({type(e).__name__}: {e}) — sqlite BLOB으로 저하"
                 print(f"[주의] {self.vec_error}", file=sys.stderr)
 
     @property
@@ -810,9 +840,17 @@ class RagStore:
             self.conn.commit()
             self._generation += 1  # (sqlite 백엔드) 벡터 캐시 무효화
         if use_qdrant:
-            self.vec.delete(old_chunk_ids)
-            if vectors:
-                self.vec.upsert(new_ids, vectors)
+            try:
+                self.vec.delete(old_chunk_ids)
+                if vectors:
+                    self.vec.upsert(new_ids, vectors)
+            except Exception:
+                # 벡터 쓰기 실패(서버 모드에서 Qdrant가 내려감 등) — sqlite는 이미 커밋됐으므로
+                # mtime을 무효값으로 바꿔 다음 증분 실행이 이 파일을 '변경됨'으로 다시 잡게 한다.
+                with self._lock:
+                    self.conn.execute("UPDATE files SET mtime = -1 WHERE id = ?", (fid,))
+                    self.conn.commit()
+                raise
         return len(chunks)
 
     def remove_missing(self, existing_paths: set[str]) -> int:
@@ -993,7 +1031,8 @@ _store_lock = threading.Lock()
 def get_store() -> RagStore:
     global _store
     with _store_lock:
-        if _store is None or _store.path != DB_PATH or _store.qdrant_path != QDRANT_PATH:
+        if (_store is None or _store.path != DB_PATH or _store.qdrant_path != QDRANT_PATH
+                or _store.qdrant_url != QDRANT_URL or _store.qdrant_collection != QDRANT_COLLECTION):
             _store = RagStore(DB_PATH, QDRANT_PATH)
         return _store
 
@@ -1023,7 +1062,9 @@ def status_text() -> str:
         f"임베딩 서버({EMBED_URL}): {'연결됨' if embed_ok else '연결 안 됨 — 검색이 키워드 전용으로 동작'}",
         f"리랭커 서버({RERANK_URL}): {'연결됨' if _rerank_available() else '연결 안 됨 — RRF 순위를 그대로 사용'}",
         (
-            f"벡터 저장소: Qdrant 로컬 ({store.qdrant_path})"
+            f"벡터 저장소: Qdrant 서버 ({store.qdrant_url}, 컬렉션 {store.qdrant_collection})"
+            if store.vec_kind == "qdrant" and store.vec.mode == "server"
+            else f"벡터 저장소: Qdrant 로컬 ({store.qdrant_path})"
             if store.vec_kind == "qdrant"
             else "벡터 저장소: sqlite BLOB"
             + (f" — {store.vec_error}" if store.vec_error else "")

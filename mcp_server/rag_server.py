@@ -22,6 +22,7 @@ llm_studio 장착 (코드 변경 불필요): 데이터 폴더의 mcp_servers.jso
 ⚠ 이 서버가 떠 있는 동안 rag_indexer를 돌리면 Qdrant 로컬 잠금 때문에 인덱서가
 시작을 거부한다 — 인덱싱할 때는 이 서버를 잠시 내릴 것. 반대로 인덱서가 도는 중에
 이 서버를 띄우면 벡터 검색이 sqlite BLOB으로 저하한다(rag_status에 사유 표시).
+Qdrant 서버 모드(--qdrant-url http://127.0.0.1:6333)는 잠금이 없어 둘을 동시에 돌려도 된다.
 """
 
 from __future__ import annotations
@@ -168,6 +169,10 @@ if __name__ == "__main__":
     parser.add_argument("--db", default=None, help=f"인덱스 파일 경로 (기본 {core.DB_PATH})")
     parser.add_argument("--qdrant", default=None,
                         help=f"Qdrant 로컬 데이터 폴더 (기본 {core.QDRANT_PATH})")
+    parser.add_argument("--qdrant-url", default=None,
+                        help="Qdrant 서버 주소 (예: http://127.0.0.1:6333). 주면 로컬 폴더 대신 서버 모드")
+    parser.add_argument("--qdrant-collection", default=None,
+                        help=f"Qdrant 벡터 컬렉션 이름 (기본 {core.QDRANT_COLLECTION})")
     parser.add_argument("--embed-url", default=None,
                         help=f"임베딩 서버 /v1 베이스 URL (기본 {core.EMBED_URL})")
     parser.add_argument("--rerank-url", default=None,
@@ -201,6 +206,10 @@ if __name__ == "__main__":
         core.DB_PATH = os.path.abspath(os.path.expanduser(args.db))
     if args.qdrant:
         core.QDRANT_PATH = os.path.abspath(os.path.expanduser(args.qdrant))
+    if args.qdrant_url:
+        core.QDRANT_URL = args.qdrant_url
+    if args.qdrant_collection:
+        core.QDRANT_COLLECTION = args.qdrant_collection
     if args.embed_url:
         core.EMBED_URL = args.embed_url
     if args.rerank_url:
